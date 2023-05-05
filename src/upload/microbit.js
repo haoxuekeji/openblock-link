@@ -6,25 +6,36 @@ const os = require('os');
 
 const FLASH_TIME = 25 * 1000; // 20s
 
+const ABORT_STATE_CHECK_INTERVAL = 100;
+
 const UFLASH_MODULE_NAME = 'uflash';
 const MICROFS_MODULE_NAME = 'microfs';
 
 class Microbit {
-    constructor (peripheralPath, config, userDataPath, toolsPath, sendstd) {
+    constructor (peripheralPath, config, userDataPath, toolsPath, sendstd, sendRemoteRequest) {
         this._peripheralPath = peripheralPath;
         this._config = config;
         this._userDataPath = userDataPath;
         this._projectPath = path.join(userDataPath, 'microbit/project');
         this._pythonPath = path.join(toolsPath, 'Python');
         this._sendstd = sendstd;
+        this._sendRemoteRequest = sendRemoteRequest;
+
+        this._abort = false;
 
         if (os.platform() === 'darwin') {
-            this._pyPath = path.join(this._pythonPath, 'bin/python');
+            this._pyPath = path.join(this._pythonPath, 'python3');
+        } else if (os.platform() === 'linux') {
+            this._pyPath = path.join(this._pythonPath, 'bin/python3');
         } else {
             this._pyPath = path.join(this._pythonPath, 'python');
         }
 
         this._codefilePath = path.join(this._projectPath, 'main.py');
+    }
+
+    abortUpload () {
+        this._abort = true;
     }
 
     async flash (code, library = []) {
@@ -58,15 +69,25 @@ class Microbit {
             await this.uflash();
         }
 
+        if (this._abort === true) {
+            return Promise.resolve('Aborted');
+        }
+
         this._sendstd('Writing files...\n');
 
         for (const file of fileToPut) {
             const ufsPutExitCode = await this.ufsPut(file);
-            if (ufsPutExitCode !== 'Success') {
+            if (ufsPutExitCode !== 'Success' && ufsPutExitCode !== 'Aborted') {
                 return Promise.reject(ufsPutExitCode);
+            }
+            if (this._abort === true) {
+                break;
             }
         }
 
+        if (this._abort === true) {
+            return Promise.resolve('Aborted');
+        }
         this._sendstd(`${ansi.green_dark}Success\n`);
         return Promise.resolve('Success');
     }
@@ -77,13 +98,23 @@ class Microbit {
         return new Promise(resolve => {
             const ufs = spawn(this._pyPath, ['-m', MICROFS_MODULE_NAME, 'ls']);
 
-            ufs.stdout.on('data', buf => {
-                if (buf.toString().indexOf('Could not enter raw REPL.') !== -1){
+            const listenAbortSignal = setInterval(() => {
+                if (this._abort) {
+                    ufs.kill();
+                }
+            }, ABORT_STATE_CHECK_INTERVAL);
+
+            ufs.on('exit', outCode => {
+                clearInterval(listenAbortSignal);
+                switch (outCode) {
+                case null:
+                    return resolve('Aborted');
+                case 0:
+                    return resolve('Success');
+                case 1: // Could not enter raw REPL.
                     return resolve('Failed');
                 }
             });
-
-            ufs.on('exit', () => resolve('Success'));
         });
     }
 
@@ -96,8 +127,17 @@ class Microbit {
                 return resolve('Failed');
             });
 
+            const listenAbortSignal = setInterval(() => {
+                if (this._abort) {
+                    ufs.kill();
+                }
+            }, ABORT_STATE_CHECK_INTERVAL);
+
             ufs.on('exit', outCode => {
+                clearInterval(listenAbortSignal);
                 switch (outCode) {
+                case null:
+                    return resolve('Aborted');
                 case 0:
                     this._sendstd(`${file} write finish\n`);
                     return resolve('Success');
@@ -110,6 +150,10 @@ class Microbit {
 
     uflash () {
         return new Promise((resolve, reject) => {
+            // For some unknown reason, uflash cannot be killed in the test, so the termination button is disabled
+            // when uflash is running.
+            this._sendRemoteRequest('setUploadAbortEnabled', false);
+
             const uflash = spawn(this._pyPath, ['-m', UFLASH_MODULE_NAME]);
 
             this._sendstd(`${ansi.green_dark}Start flash firmware...\n`);
