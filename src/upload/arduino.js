@@ -5,11 +5,11 @@ const ansi = require('ansi-string');
 const yaml = require('js-yaml');
 const os = require('os');
 
-const AVRDUDE_STDOUT_GREEN_START = /Reading \||Writing \|/g;
-const AVRDUDE_STDOUT_GREEN_END = /%/g;
-const AVRDUDE_STDOUT_WHITE = /avrdude done/g;
-const AVRDUDE_STDOUT_RED_START = /can't open device|programmer is not responding/g;
-const AVRDUDE_STDERR_RED_IGNORE = /Executable segment sizes/g;
+const ARDUINO_CLI_STDOUT_GREEN_START = /Reading \||Writing \|/g;
+const ARDUINO_CLI_STDOUT_GREEN_END = /%/g;
+const ARDUINO_CLI_STDOUT_WHITE = /avrdude done/g;
+const ARDUINO_CLI_STDOUT_RED_START = /can't open device|programmer is not responding/g;
+const ARDUINO_CLI_STDERR_RED_IGNORE = /Executable segment sizes/g;
 
 const ABORT_STATE_CHECK_INTERVAL = 100;
 
@@ -32,34 +32,37 @@ class Arduino {
 
         const projectPathName = `${this._config.fqbn.replace(/:/g, '_')}_project`.split(/_/).splice(0, 3)
             .join('_');
-        this._projectfilePath = path.join(this._userDataPath, 'arduino', projectPathName);
+        this._configFilePath = path.join(this._userDataPath, 'arduino/arduino-cli.yaml');
+        this._projectFilePath = path.join(this._userDataPath, 'arduino', projectPathName);
 
         this._arduinoCliPath = path.join(this._arduinoPath, 'arduino-cli');
 
-        this._codeFolderPath = path.join(this._projectfilePath, 'code');
-        this._codefilePath = path.join(this._codeFolderPath, 'code.ino');
-        this._buildPath = path.join(this._projectfilePath, 'build');
-        this._buildCachePath = path.join(this._projectfilePath, 'buildCache');
+        this._codeFolderPath = path.join(this._projectFilePath, 'code');
+        this._codeFilePath = path.join(this._codeFolderPath, 'code.ino');
+        this._buildPath = path.join(this._projectFilePath, 'build');
+        this._buildCachePath = path.join(this._projectFilePath, 'buildCache');
 
         this.initArduinoCli();
     }
 
     initArduinoCli () {
         // try to init the arduino cli config.
-        spawnSync(this._arduinoCliPath, ['config', 'init']);
+        spawnSync(this._arduinoCliPath, ['config', 'init', '--dest-file', this._configFilePath]);
 
         // if arduino cli config haven be init, set it to link arduino path.
-        const buf = spawnSync(this._arduinoCliPath, ['config', 'dump']);
+        const buf = spawnSync(this._arduinoCliPath, ['config', 'dump', '--config-file', this._configFilePath]);
         try {
             const stdout = yaml.load(buf.stdout.toString());
 
             if (stdout.directories.data !== this._arduinoPath) {
                 this._sendstd(`${ansi.yellow_dark}arduino cli config has not been initialized yet.\n`);
                 this._sendstd(`${ansi.green_dark}set the path to ${this._arduinoPath}.\n`);
-                spawnSync(this._arduinoCliPath, ['config', 'set', 'directories.data', this._arduinoPath]);
+                spawnSync(this._arduinoCliPath, ['config', 'set', 'directories.data', this._arduinoPath,
+                    '--config-file', this._configFilePath]);
                 spawnSync(this._arduinoCliPath, ['config', 'set', 'directories.downloads',
-                    path.join(this._arduinoPath, 'staging')]);
-                spawnSync(this._arduinoCliPath, ['config', 'set', 'directories.user', this._arduinoPath]);
+                    path.join(this._arduinoPath, 'staging'), '--config-file', this._configFilePath]);
+                spawnSync(this._arduinoCliPath, ['config', 'set', 'directories.user', this._arduinoPath,
+                    '--config-file', this._configFilePath]);
             }
         } catch (err) {
             this._sendstd(`${ansi.red}arduino cli init error:`, err);
@@ -71,14 +74,14 @@ class Arduino {
         this._abort = true;
     }
 
-    build (code, library = []) {
+    build (code) {
         return new Promise((resolve, reject) => {
             if (!fs.existsSync(this._codeFolderPath)) {
                 fs.mkdirSync(this._codeFolderPath, {recursive: true});
             }
 
             try {
-                fs.writeFileSync(this._codefilePath, code);
+                fs.writeFileSync(this._codeFilePath, code);
             } catch (err) {
                 return reject(err);
             }
@@ -91,29 +94,31 @@ class Arduino {
                 '--verbose',
                 '--build-path', this._buildPath,
                 '--build-cache-path', this._buildCachePath,
+                '--config-file', this._configFilePath,
                 this._codeFolderPath
             ];
 
             // if extensions library to not empty
-            library.forEach(lib => {
+            this._config.library.forEach(lib => {
                 if (fs.existsSync(lib)) {
-                    args.splice(5, 0, '--libraries', lib);
+                    args.splice(3, 0, '--libraries', lib);
                 }
             });
 
-            const arduinoBuilder = spawn(this._arduinoCliPath, args);
+            const arduinoCli = spawn(this._arduinoCliPath, args);
+            this._sendstd(`Start building...\n`);
 
-            arduinoBuilder.stderr.on('data', buf => {
+            arduinoCli.stderr.on('data', buf => {
                 const data = buf.toString();
 
-                if (data.search(AVRDUDE_STDERR_RED_IGNORE) !== -1) { // eslint-disable-line no-negated-condition
-                    this._sendstd(data);
+                if (data.search(ARDUINO_CLI_STDERR_RED_IGNORE) !== -1) { // eslint-disable-line no-negated-condition
+                    this._sendstd(ansi.red + data);
                 } else {
                     this._sendstd(ansi.red + data);
                 }
             });
 
-            arduinoBuilder.stdout.on('data', buf => {
+            arduinoCli.stdout.on('data', buf => {
                 const data = buf.toString();
                 let ansiColor = null;
 
@@ -127,11 +132,11 @@ class Arduino {
 
             const listenAbortSignal = setInterval(() => {
                 if (this._abort) {
-                    arduinoBuilder.kill();
+                    arduinoCli.kill();
                 }
             }, ABORT_STATE_CHECK_INTERVAL);
 
-            arduinoBuilder.on('exit', outCode => {
+            arduinoCli.on('exit', outCode => {
                 clearInterval(listenAbortSignal);
                 this._sendstd(`${ansi.clear}\r\n`); // End ansi color setting
                 switch (outCode) {
@@ -165,6 +170,7 @@ class Arduino {
             '--fqbn', this._config.fqbn,
             '--verbose',
             '--verify',
+            '--config-file', this._configFilePath,
             `-p${this._peripheralPath}`
         ];
 
@@ -181,29 +187,29 @@ class Arduino {
         }
 
         return new Promise((resolve, reject) => {
-            const avrdude = spawn(this._arduinoCliPath, args);
+            const arduinoCli = spawn(this._arduinoCliPath, args);
 
-            avrdude.stderr.on('data', buf => {
+            arduinoCli.stderr.on('data', buf => {
                 let data = buf.toString();
 
                 // todo: Because the feacture of avrdude sends STD information intermittently.
                 // There should be a better way to handle these mesaage.
-                if (data.search(AVRDUDE_STDOUT_GREEN_START) !== -1) {
-                    data = this._insertStr(data, data.search(AVRDUDE_STDOUT_GREEN_START), ansi.green_dark);
+                if (data.search(ARDUINO_CLI_STDOUT_GREEN_START) !== -1) {
+                    data = this._insertStr(data, data.search(ARDUINO_CLI_STDOUT_GREEN_START), ansi.green_dark);
                 }
-                if (data.search(AVRDUDE_STDOUT_GREEN_END) !== -1) {
-                    data = this._insertStr(data, data.search(AVRDUDE_STDOUT_GREEN_END) + 1, ansi.clear);
+                if (data.search(ARDUINO_CLI_STDOUT_GREEN_END) !== -1) {
+                    data = this._insertStr(data, data.search(ARDUINO_CLI_STDOUT_GREEN_END) + 1, ansi.clear);
                 }
-                if (data.search(AVRDUDE_STDOUT_WHITE) !== -1) {
-                    data = this._insertStr(data, data.search(AVRDUDE_STDOUT_WHITE), ansi.clear);
+                if (data.search(ARDUINO_CLI_STDOUT_WHITE) !== -1) {
+                    data = this._insertStr(data, data.search(ARDUINO_CLI_STDOUT_WHITE), ansi.clear);
                 }
-                if (data.search(AVRDUDE_STDOUT_RED_START) !== -1) {
-                    data = this._insertStr(data, data.search(AVRDUDE_STDOUT_RED_START), ansi.red);
+                if (data.search(ARDUINO_CLI_STDOUT_RED_START) !== -1) {
+                    data = this._insertStr(data, data.search(ARDUINO_CLI_STDOUT_RED_START), ansi.red);
                 }
                 this._sendstd(data);
             });
 
-            avrdude.stdout.on('data', buf => {
+            arduinoCli.stdout.on('data', buf => {
                 // It seems that avrdude didn't use stdout.
                 const data = buf.toString();
                 this._sendstd(data);
@@ -212,28 +218,21 @@ class Arduino {
             const listenAbortSignal = setInterval(() => {
                 if (this._abort) {
                     if (os.platform() === 'win32') {
-                        spawnSync('taskkill', ['/pid', avrdude.pid, '/f', '/t']);
+                        spawnSync('taskkill', ['/pid', arduinoCli.pid, '/f', '/t']);
                     } else {
-                        avrdude.kill();
+                        arduinoCli.kill();
                     }
                 }
             }, ABORT_STATE_CHECK_INTERVAL);
 
-            avrdude.on('exit', code => {
+            arduinoCli.on('exit', code => {
                 clearInterval(listenAbortSignal);
                 const wait = ms => new Promise(relv => setTimeout(relv, ms));
                 switch (code) {
                 case 0:
-                    if (this._config.fqbn === 'arduino:avr:leonardo' ||
-                        this._config.fqbn === 'SparkFun:avr:makeymakey' ||
-                        this._config.fqbn.indexOf('rp2040:rp2040') !== -1) {
+                    if (this._config.postUploadDelay) {
                         // Waiting for usb rerecognize.
-                        // Darwin and linux will take more time to rerecognize device.
-                        if (os.platform() === 'darwin' || os.platform() === 'linux') {
-                            wait(3000).then(() => resolve('Success'));
-                        } else {
-                            wait(1000).then(() => resolve('Success'));
-                        }
+                        wait(this._config.postUploadDelay).then(() => resolve('Success'));
                     } else {
                         return resolve('Success');
                     }
