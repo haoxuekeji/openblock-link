@@ -98,6 +98,11 @@ class Microbit {
         return new Promise(resolve => {
             const ufs = spawn(this._pyPath, ['-m', MICROFS_MODULE_NAME, 'ls']);
 
+            ufs.on('error', err => {
+                clearInterval(listenAbortSignal);
+                return resolve('Failed');
+            });
+
             const listenAbortSignal = setInterval(() => {
                 if (this._abort) {
                     ufs.kill();
@@ -121,6 +126,11 @@ class Microbit {
     ufsPut (file) {
         return new Promise((resolve, reject) => {
             const ufs = spawn(this._pyPath, ['-m', MICROFS_MODULE_NAME, 'put', file]);
+
+            ufs.on('error', err => {
+                clearInterval(listenAbortSignal);
+                return reject(err);
+            });
 
             ufs.stdout.on('data', buf => {
                 this._sendstd(ansi.red + buf.toString());
@@ -155,6 +165,11 @@ class Microbit {
             this._sendRemoteRequest('setUploadAbortEnabled', false);
 
             const uflash = spawn(this._pyPath, ['-m', UFLASH_MODULE_NAME]);
+
+            uflash.on('error', err => {
+                this._sendRemoteRequest('setUploadAbortEnabled', true);
+                return reject(err);
+            });
 
             this._sendstd(`${ansi.green_dark}Start flash firmware...\n`);
             this._sendstd(`${ansi.clear}This step will take tens of seconds, pelese wait.\n`);
