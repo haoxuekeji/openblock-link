@@ -4,6 +4,7 @@ const ansi = require('ansi-string');
 const Session = require('./session');
 const Arduino = require('../upload/arduino');
 const Microbit = require('../upload/microbit');
+const MicroPython = require('../upload/microPython');
 const usbId = require('../lib/usb-id');
 
 const PERIPHERAL_UNPLUG_CHECK_INTERVAL = 100;
@@ -47,6 +48,9 @@ class SerialportSession extends Session {
         case 'write':
             completion(await this.write(params), null);
             break;
+        case 'hardReset':
+            completion(await this.hardReset(), null);
+            break;
         case 'read':
             await this.read(params);
             completion(null, null);
@@ -59,6 +63,18 @@ class SerialportSession extends Session {
             break;
         case 'abortUpload':
             completion(await this.abortUpload(), null);
+            break;
+        case 'listBoardFiles':
+            completion(await this.listBoardFiles(params), null);
+            break;
+        case 'readBoardFile':
+            completion(await this.readBoardFile(params), null);
+            break;
+        case 'removeBoardFile':
+            completion(await this.removeBoardFile(params), null);
+            break;
+        case 'writeBoardFile':
+            completion(await this.writeBoardFile(params), null);
             break;
         case 'getServices':
             completion((this.services || []).map(service => service.uuid), null);
@@ -264,6 +280,37 @@ class SerialportSession extends Session {
         this.isRead = true;
     }
 
+    /**
+     * Pulse the DTR/RTS control lines to trigger the reset circuit of a
+     * typical dev board (esptool style: EN wired to RTS, IO0 to DTR),
+     * then restore the configured line state.
+     * @return {Promise} - resolved when the pulse is done.
+     */
+    hardReset () {
+        return new Promise((resolve, reject) => {
+            if (!this.peripheral || this.peripheral.isOpen !== true || this.isInDisconnect) {
+                return resolve();
+            }
+            const config = this.peripheralParams.peripheralConfig.config;
+            const rts = (typeof config.rts === 'undefined') ? true : config.rts;
+            const dtr = (typeof config.dtr === 'undefined') ? true : config.dtr;
+
+            this.peripheral.set({dtr: false, rts: true}, assertErr => {
+                if (assertErr) {
+                    return reject(new Error(assertErr));
+                }
+                setTimeout(() => {
+                    this.peripheral.set({dtr: dtr, rts: rts}, restoreErr => {
+                        if (restoreErr) {
+                            return reject(new Error(restoreErr));
+                        }
+                        return resolve();
+                    });
+                }, 100);
+            });
+        });
+    }
+
     disconnect () {
         this.isInDisconnect = true;
         return new Promise((resolve, reject) => {
@@ -355,6 +402,29 @@ class SerialportSession extends Session {
                 this.sendRemoteRequest('peripheralUnplug', null);
             }
             break;
+        case 'microPython':
+            this.tool = new MicroPython(this.peripheral.path, config, this.userDataPath,
+                this.toolsPath, this.sendstd.bind(this), this.sendRemoteRequest.bind(this));
+            try {
+                this.sendRemoteRequest('setUploadAbortEnabled', true);
+                this.sendstd(`${ansi.clear}Disconnect serial port\n`);
+                await this.disconnect();
+                this.sendstd(`${ansi.clear}Disconnected successfully, uploading program starting...\n`);
+                const exitCode = await this.tool.flash(code);
+                await this.connect(this.peripheralParams, true);
+                await this.updateBaudrate({baudRate: 115200});
+                this.sendstd(`${ansi.clear}Reset device\n`);
+                await this.write({message: '04', encoding: 'hex'});
+                await this.updateBaudrate({baudRate: baudRate});
+
+                this.sendRemoteRequest('uploadSuccess', {aborted: exitCode === 'Aborted'});
+            } catch (err) {
+                this.sendRemoteRequest('uploadError', {
+                    message: ansi.red + err.message
+                });
+                this.sendRemoteRequest('peripheralUnplug', null);
+            }
+            break;
         }
 
         this.tool = null;
@@ -379,6 +449,23 @@ class SerialportSession extends Session {
                 });
             }
             break;
+        case 'microPython':
+            this.tool = new MicroPython(this.peripheral.path, params, this.userDataPath,
+                this.toolsPath, this.sendstd.bind(this), this.sendRemoteRequest.bind(this));
+            try {
+                this.sendRemoteRequest('setUploadAbortEnabled', true);
+                this.sendstd(`${ansi.clear}Disconnect serial port\n`);
+                await this.disconnect();
+                this.sendstd(`${ansi.clear}Disconnected successfully, flash firmware starting...\n`);
+                const flashExitCode = await this.tool.flashFirmware();
+                await this.connect(this.peripheralParams, true);
+                this.sendRemoteRequest('uploadSuccess', {aborted: flashExitCode === 'Aborted'});
+            } catch (err) {
+                this.sendRemoteRequest('uploadError', {
+                    message: ansi.red + err.message
+                });
+            }
+            break;
         }
 
         this.tool = null;
@@ -388,6 +475,58 @@ class SerialportSession extends Session {
         if (this.tool !== null) {
             this.tool.abortUpload();
         }
+    }
+
+    /**
+     * Run a MicroPython board-filesystem helper while temporarily releasing
+     * the serial port (obmpy needs exclusive access).
+     * @param {object} params - request params including config.
+     * @param {Function} runner - async (tool) => result.
+     * @return {Promise} resolved with the runner result.
+     * @private
+     */
+    async _withMicroPythonTool (params, runner) {
+        if (!this.peripheral || !this.peripheral.path) {
+            throw new Error('No peripheral is connected');
+        }
+        const config = (params && params.config) || {type: 'microPython'};
+        const tool = new MicroPython(
+            this.peripheral.path,
+            config,
+            this.userDataPath,
+            this.toolsPath,
+            this.sendstd.bind(this),
+            this.sendRemoteRequest.bind(this)
+        );
+        const reconnectParams = this.peripheralParams;
+        await this.disconnect();
+        try {
+            return await runner(tool);
+        } finally {
+            if (reconnectParams) {
+                await this.connect(reconnectParams, true);
+            }
+        }
+    }
+
+    async listBoardFiles (params) {
+        return this._withMicroPythonTool(params, tool =>
+            tool.listFiles(params && params.directory));
+    }
+
+    async readBoardFile (params) {
+        return this._withMicroPythonTool(params, tool =>
+            tool.readFile(params && params.path));
+    }
+
+    async removeBoardFile (params) {
+        return this._withMicroPythonTool(params, tool =>
+            tool.removeFile(params && params.path));
+    }
+
+    async writeBoardFile (params) {
+        return this._withMicroPythonTool(params, tool =>
+            tool.writeFile(params && params.path, params && params.contentBase64));
     }
 
     sendstd (message) {
