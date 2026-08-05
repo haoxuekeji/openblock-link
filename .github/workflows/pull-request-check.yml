@@ -11,7 +11,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [12.x, 14.x, 16.x]
+        # Node 24 is the release baseline (see OB-030/OB-031 release manifests).
+        node-version: [24.x]
     steps:
       - uses: actions/checkout@v4
 
