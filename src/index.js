@@ -47,7 +47,8 @@ const REOPEN_INTERVAL = 1000 * 1;
  * @readonly
  */
 const ROUTERS = {
-    '/openblock/serialport': require('./session/serialport') // eslint-disable-line global-require
+    '/openblock/serialport': require('./session/serialport'), // eslint-disable-line global-require
+    '/openblock/python': require('./session/pythonRunner') // eslint-disable-line global-require
 };
 
 /**
@@ -85,7 +86,7 @@ class OpenBlockLink extends Emitter{
             let session;
             
             if (Session) {
-                session = new Session(socket, this.userDataPath, this.toolsPath);
+                session = new Session(socket, this.userDataPath, this.toolsPath, request);
                 console.info('new connection');
                 this.emit('new-connection');
             } else {
