@@ -47,43 +47,69 @@ class PythonRunnerSession extends Session {
     }
 
     async didReceiveCall (method, params, completion) {
-        switch (method) {
-        case 'run':
-            completion(await this.run(params), null);
-            break;
-        case 'stdin':
-            completion(this.writeStdin(params), null);
-            break;
-        case 'stop':
-            completion(this.stop(), null);
-            break;
-        case 'interpreter':
-            completion(this.resolveInterpreter(), null);
-            break;
-        default:
-            throw new Error(`Method not found`);
+        // The base session only catches synchronous throws; an exception
+        // escaping an async handler would crash the whole link process as
+        // an unhandled rejection, so report errors via the JSON-RPC
+        // response instead.
+        try {
+            switch (method) {
+            case 'run':
+                completion(await this.run(params), null);
+                break;
+            case 'pip':
+                completion(this.pip(params), null);
+                break;
+            case 'stdin':
+                completion(this.writeStdin(params), null);
+                break;
+            case 'stop':
+                completion(this.stop(), null);
+                break;
+            case 'interpreter':
+                completion(this.resolveInterpreter(), null);
+                break;
+            default:
+                throw new Error(`Method not found`);
+            }
+        } catch (err) {
+            completion(null, {message: `${err.message || err}`});
         }
     }
 
     /**
-     * Find a usable python executable. Prefer the toolchain bundled with the
-     * link tools (layout differs per platform, see upload/microPython.js),
-     * fall back to the system interpreter so development setups without a
-     * matching tools bundle still work.
+     * Find a usable python executable, in order of preference:
+     * 1. a dedicated standard runtime bundle (PythonRuntime, distributed via
+     *    the external resources updater, python-build-standalone layout),
+     * 2. the flashing toolchain python (layout differs per platform, see
+     *    upload/microPython.js),
+     * 3. the system interpreter, so development setups without a matching
+     *    bundle still work.
      * @returns {string} path or command of the python executable
      */
     resolveInterpreter () {
         if (this._interpreter) {
             return this._interpreter;
         }
-        const pythonDir = path.join(this.toolsPath, 'Python');
+        const runtimeDir = path.join(this.toolsPath, 'PythonRuntime');
+        const toolchainDir = path.join(this.toolsPath, 'Python');
         let candidates;
         if (os.platform() === 'win32') {
-            candidates = [path.join(pythonDir, 'python.exe'), path.join(pythonDir, 'python'), 'python'];
-        } else if (os.platform() === 'darwin') {
-            candidates = [path.join(pythonDir, 'python3'), 'python3'];
+            candidates = [
+                path.join(runtimeDir, 'python.exe'),
+                path.join(runtimeDir, 'python/python.exe'),
+                path.join(toolchainDir, 'python.exe'),
+                path.join(toolchainDir, 'python'),
+                'python'
+            ];
         } else {
-            candidates = [path.join(pythonDir, 'bin/python3'), 'python3'];
+            candidates = [
+                path.join(runtimeDir, 'bin/python3'),
+                path.join(runtimeDir, 'python/bin/python3'),
+                os.platform() === 'darwin' ?
+                    path.join(toolchainDir, 'python3') :
+                    path.join(toolchainDir, 'bin/python3'),
+                'python3'
+            ];
         }
         for (const candidate of candidates) {
             try {
@@ -105,20 +131,67 @@ class PythonRunnerSession extends Session {
 
     async run (params) {
         const code = (params && params.code) || '';
+        const files = (params && params.files) || {};
 
         this.stop();
 
         await fs.promises.mkdir(this._projectPath, {recursive: true});
+        // Multi-file projects: write helper modules next to main.py. Names
+        // are restricted to plain file names so code stays inside the
+        // project directory.
+        for (const name of Object.keys(files)) {
+            if (!(/^[\w.-]+$/).test(name) || name.includes('..')) {
+                throw new Error(`invalid file name: ${name}`);
+            }
+            await fs.promises.writeFile(path.join(this._projectPath, name), `${files[name]}`, 'utf8');
+        }
         const codeFile = path.join(this._projectPath, 'main.py');
         await fs.promises.writeFile(codeFile, code, 'utf8');
 
+        return this.spawnChild(['-u', codeFile]);
+    }
+
+    /**
+     * Install packages with the interpreter's own pip. Shares the child
+     * slot and the stdout/stderr/exit notification stream with run(), so a
+     * running program is stopped first and the client can reuse its
+     * terminal handling as-is.
+     * @param {object} params - {packages: string[]}
+     * @returns {object} pid and interpreter, as with run()
+     */
+    pip (params) {
+        const packages = (params && params.packages) || [];
+        if (!Array.isArray(packages) || packages.length === 0) {
+            throw new Error('packages must be a non-empty array');
+        }
+        // Package name with optional extras and version spec; refuses pip
+        // flags so clients cannot smuggle in options like --index-url.
+        const pkgPattern = /^[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9,_-]+\])?([=<>!~]=?[A-Za-z0-9.*+!-]+)?$/;
+        for (const pkg of packages) {
+            if (typeof pkg !== 'string' || !pkgPattern.test(pkg)) {
+                throw new Error(`invalid package name: ${pkg}`);
+            }
+        }
+        this.stop();
+        return this.spawnChild(['-m', 'pip', 'install', '--no-input', ...packages]);
+    }
+
+    spawnChild (args) {
+        // pip may run before any code has been executed.
+        fs.mkdirSync(this._projectPath, {recursive: true});
         const interpreter = this.resolveInterpreter();
-        const child = spawn(interpreter, ['-u', codeFile], {
+        const env = Object.assign({}, process.env, {
+            PYTHONIOENCODING: 'utf-8',
+            PYTHONUNBUFFERED: '1'
+        });
+        // Default to a domestic mirror so pip works out of the box; an
+        // existing user/env configuration always wins.
+        if (!env.PIP_INDEX_URL) {
+            env.PIP_INDEX_URL = 'https://mirrors.aliyun.com/pypi/simple/';
+        }
+        const child = spawn(interpreter, args, {
             cwd: this._projectPath,
-            env: Object.assign({}, process.env, {
-                PYTHONIOENCODING: 'utf-8',
-                PYTHONUNBUFFERED: '1'
-            }),
+            env: env,
             // Own process group on posix so stop() can kill the whole tree.
             detached: os.platform() !== 'win32'
         });
