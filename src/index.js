@@ -137,7 +137,13 @@ class OpenBlockLink extends Emitter{
 
         this._httpServer.on('request', (request, res) => {
             if (request.url === '/') {
-                res.writeHead(200, {'Content-Type': 'text/html'});
+                // CORS is open on purpose: this endpoint only echoes the
+                // server name so web pages (e.g. the platform playground)
+                // can probe whether a local Link service is available.
+                res.writeHead(200, {
+                    'Content-Type': 'text/html',
+                    'Access-Control-Allow-Origin': '*'
+                });
                 res.end(SERVER_NAME);
             }
         });
