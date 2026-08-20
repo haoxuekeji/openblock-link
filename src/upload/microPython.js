@@ -38,6 +38,25 @@ const FIRMWARE_CONFIRM_TIMEOUT = 5 * 60 * 1000;
 // and initialize its file system.
 const FIRMWARE_BOOT_TIME = 10 * 1000;
 
+// esptool cannot talk to a chip that never entered (or dropped out of)
+// download mode. On boards without an auto-reset circuit (DTR/RTS not wired)
+// this surfaces as one of the signatures below and the only fix is holding
+// the BOOT button, so translate it into actionable guidance instead of a
+// bare exit code.
+const ESPTOOL_SYNC_FAILURE_PATTERNS = [
+    'failed to connect',
+    'timed out waiting for packet header',
+    'wrong boot mode detected',
+    'invalid head of packet',
+    'no serial data received',
+    'getting no sync reply'
+];
+
+// Single-line summary embedded in the rejection so the GUI upload dialog
+// shows the fix next to the "Upload error" banner.
+const ESPTOOL_SYNC_GUIDANCE =
+    '未能与芯片同步:板子可能没有自动下载电路,请按住 BOOT(IO0)键插上 USB 或按一下 RST/EN 键,再重试烧录';
+
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 class MicroPython {
@@ -535,6 +554,8 @@ class MicroPython {
         return new Promise((resolve, reject) => {
             const esptool = spawn(this._pyPath, [this._esptoolPath].concat(args));
 
+            let output = '';
+
             const listenAbortSignal = setInterval(() => {
                 if (this._abort) {
                     esptool.kill();
@@ -542,11 +563,15 @@ class MicroPython {
             }, ABORT_STATE_CHECK_INTERVAL);
 
             esptool.stdout.on('data', buf => {
-                this._sendstd(buf.toString());
+                const text = buf.toString();
+                output += text;
+                this._sendstd(text);
             });
 
             esptool.stderr.on('data', buf => {
-                this._sendstd(ansi.red + buf.toString());
+                const text = buf.toString();
+                output += text;
+                this._sendstd(ansi.red + text);
             });
 
             esptool.on('error', err => {
@@ -563,10 +588,28 @@ class MicroPython {
                 case 0:
                     return resolve('Success');
                 default:
+                    if (MicroPython.isEsptoolSyncFailure(output)) {
+                        this._sendstd(`${ansi.yellow_dark}未能与芯片同步,板子可能没有自动下载电路(DTR/RTS 未接)。\n`);
+                        this._sendstd(`${ansi.yellow_dark}请按住板上的 BOOT(IO0)键不放,重新插一次 USB 线或按一下 RST/EN 键,\n`);
+                        this._sendstd(`${ansi.yellow_dark}等待窗口出现 Connecting 后松开 BOOT,然后重试烧录。\n`);
+                        return reject(new Error(ESPTOOL_SYNC_GUIDANCE));
+                    }
                     return reject(new Error(`esptool exited with code ${outCode}`));
                 }
             });
         });
+    }
+
+    /**
+     * Whether the collected esptool output shows the chip never entered (or
+     * dropped out of) download mode — the typical failure on boards without
+     * an auto-reset (DTR/RTS) circuit where the user must hold BOOT.
+     * @param {string} output - combined stdout/stderr of the esptool run.
+     * @return {boolean} true when it is a sync/boot-mode failure.
+     */
+    static isEsptoolSyncFailure (output) {
+        const text = String(output || '').toLowerCase();
+        return ESPTOOL_SYNC_FAILURE_PATTERNS.some(pattern => text.includes(pattern));
     }
 }
 
