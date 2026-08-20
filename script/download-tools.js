@@ -6,6 +6,7 @@ const path = require('path');
 const crypto = require('crypto');
 const {extractFull} = require('node-7z');
 const {path7za} = require('7zip-bin');
+const {fixPythonTools} = require('./fix-python-tools');
 
 // GitHub API URL, fill in your repository and username
 const user = 'openblockcc';
@@ -29,7 +30,7 @@ const formatBytes = bytes => {
 };
 
 // Extract 7z file
-const extract7zFile = (filePath, fileName) => {
+const extract7zFile = (filePath, fileName) => new Promise((resolve, reject) => {
     const outputDir = path.join(extractPath);
     if (!fs.existsSync(outputDir)) {
         fs.mkdirSync(outputDir, {recursive: true});
@@ -56,12 +57,14 @@ const extract7zFile = (filePath, fileName) => {
     sevenStream.on('end', () => {
         bar.update(1);
         console.log(`Successfully extracted ${fileName} to ${outputDir}`);
+        resolve();
     });
 
     sevenStream.on('error', err => {
         console.error(`Error extracting ${fileName}:`, err);
+        reject(err);
     });
-};
+});
 
 // Verify the checksum of the downloaded file
 const verifyChecksum = async (filePath, expectedChecksum) => new Promise((resolve, reject) => {
@@ -182,7 +185,7 @@ const downloadReleaseAssets = async () => {
                 const isValid = await verifyChecksum(filePath, expectedChecksum);
                 if (isValid) {
                     console.log(`File ${fileName} already exists and checksum matches. Skipping download.`);
-                    extract7zFile(filePath, fileName);
+                    await extract7zFile(filePath, fileName);
                     continue;
                 }
             }
@@ -193,7 +196,15 @@ const downloadReleaseAssets = async () => {
                 return false;
             }
 
-            extract7zFile(filePath, fileName);
+            await extract7zFile(filePath, fileName);
+        }
+
+        // The packaged Windows toolchain ships self-shadowing pip wrappers
+        // (Scripts/esptool.py) and can miss the extensionless obmpy wrapper;
+        // repair the extracted tree so a fresh install works out of the box.
+        const patched = fixPythonTools(path.join(extractPath, 'Python'));
+        if (patched.length > 0) {
+            console.log(`Patched portable Python tools: ${patched.join(', ')}`);
         }
 
         return true;
