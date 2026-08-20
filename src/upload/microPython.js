@@ -309,25 +309,18 @@ class MicroPython {
 
         this._sendstd(`${ansi.green_dark}Start flash firmware...\n`);
         this._sendstd(`${ansi.clear}This step will take tens of seconds, please wait.\n`);
-        this._sendstd('Erasing flash...\n');
+        this._sendstd(`Erasing flash and writing firmware ${path.basename(firmwarePath)}...\n`);
 
-        const eraseExitCode = await this.runEsptool([
-            '--chip', this._chip,
-            '--port', this._peripheralPath,
-            '--baud', ESPTOOL_BAUD,
-            'erase_flash'
-        ]);
-        if (eraseExitCode !== 'Success') {
-            return Promise.resolve(eraseExitCode);
-        }
-
-        this._sendstd(`Writing firmware ${path.basename(firmwarePath)}...\n`);
-
+        // Erase + write in a single esptool invocation (write_flash --erase-all).
+        // Two separate spawns need the chip to re-enter download mode between
+        // them, which only happens on boards with an auto-reset (DTR/RTS)
+        // circuit; boards entered download mode manually stay in the flasher
+        // stub at the transfer baud rate and the second spawn can never sync.
         const writeExitCode = await this.runEsptool([
             '--chip', this._chip,
             '--port', this._peripheralPath,
             '--baud', ESPTOOL_BAUD,
-            'write_flash', '-z', this._flashAddress,
+            'write_flash', '--erase-all', '-z', this._flashAddress,
             firmwarePath
         ]);
         if (writeExitCode !== 'Success') {
