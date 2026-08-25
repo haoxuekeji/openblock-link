@@ -36,6 +36,15 @@ const extract7zFile = (filePath, fileName) => new Promise((resolve, reject) => {
         fs.mkdirSync(outputDir, {recursive: true});
     }
 
+    // npm may drop the execute bit on nested binaries when this package is
+    // installed from a git URL (observed on CI), which makes spawning 7za
+    // fail with EACCES. Restore it before use; harmless elsewhere.
+    if (process.platform !== 'win32') {
+        try {
+            fs.chmodSync(path7za, 0o755);
+        } catch (e) { /* best effort */ }
+    }
+
     console.log(`Extracting ${fileName} to ${outputDir}...`);
 
     const bar = new ProgressBar('Extracting [:bar] :percent', {
