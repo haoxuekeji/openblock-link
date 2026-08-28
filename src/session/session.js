@@ -11,7 +11,7 @@ class Session {
 
     dispose () {
         if (this._socket) {
-            console.log('dispose socket')
+            console.log('dispose socket');
             this._socket.removeListener('message', this.onMessage);
             if (this._socket.readyState === this._socket.OPEN) {
                 this._socket.close();
@@ -22,7 +22,12 @@ class Session {
     }
 
     getNextId () {
-        return this._nextId++;
+        // Start from 1: an id of 0 is falsy and gets dropped by the
+        // truthiness checks in the JSON-RPC transports on both sides
+        // (see didReceiveResponse below and openblock-vm util/jsonrpc.js),
+        // which used to break the first server-initiated request that
+        // expected an answer (e.g. uploadFirmwareConfirm).
+        return ++this._nextId;
     }
 
     makeResponse (id, result, error) {
@@ -69,7 +74,10 @@ class Session {
             }
             if (json.method) {
                 this.didReceiveRequest(json, (result, err) => sendResponse(result, err));
-            } else if (json.result || json.error) {
+            } else if (Object.prototype.hasOwnProperty.call(json, 'result') ||
+                Object.prototype.hasOwnProperty.call(json, 'error')) {
+                // Presence check instead of truthiness: a response whose
+                // result is null/false/0 is still a valid response.
                 this.didReceiveResponse(json);
             } else {
                 throw new Error('message is neither request nor response');
@@ -89,8 +97,8 @@ class Session {
 
     didReceiveResponse (response) {
         const {id, error, result} = response;
-        if (!id) {
-            throw new Error('esponse ID value missing or wrong type');
+        if (id === null || typeof id === 'undefined') {
+            throw new Error('response ID value missing or wrong type');
         }
         const completionHandler = this._completionHandlers[id];
         if (!completionHandler) {
