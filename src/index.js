@@ -48,7 +48,12 @@ const REOPEN_INTERVAL = 1000 * 1;
  */
 const ROUTERS = {
     '/openblock/serialport': require('./session/serialport'), // eslint-disable-line global-require
-    '/openblock/python': require('./session/pythonRunner') // eslint-disable-line global-require
+    '/openblock/python': require('./session/pythonRunner'), // eslint-disable-line global-require
+    // Scratch Link compatible BLE endpoint. openblock-vm's ScratchLinkBLE
+    // backend connects here when Web Bluetooth is unavailable (http
+    // deployments, non-Chromium browsers, user cancelled the picker).
+    '/scratch/ble': require('./session/ble'), // eslint-disable-line global-require
+    '/openblock/ble': require('./session/ble') // eslint-disable-line global-require
 };
 
 /**

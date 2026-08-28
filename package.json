@@ -11,7 +11,7 @@
     "docs": "jsdoc -c .jsdoc.json",
     "lint": "eslint ./src",
     "fix-tools": "node script/fix-python-tools.js",
-    "test": "node test/micropython-esptool-guidance.js && node test/fix-python-tools.js && node test/smoke.js",
+    "test": "node test/micropython-esptool-guidance.js && node test/fix-python-tools.js && node test/ble-protocol.js && node test/serialport-protocol.js && node test/smoke.js",
     "test:multi-server": "node test/start-multi-server.js --log-level=info"
   },
   "repository": {
@@ -35,6 +35,7 @@
   },
   "homepage": "https://github.com/openblockcc/openblock-link#readme",
   "dependencies": {
+    "@stoprocent/noble": "^2.8.0",
     "7zip-bin": "^5.2.0",
     "ansi-string": "^0.2.1",
     "axios": "^1.9.0",
