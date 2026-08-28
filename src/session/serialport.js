@@ -19,7 +19,6 @@ class SerialportSession extends Session {
         this._type = 'serialport';
         this.peripheral = null;
         this.peripheralParams = null;
-        this.services = null;
         this.reportedPeripherals = {};
         this.connectStateDetectorTimer = null;
         this.peripheralsScanorTimer = null;
@@ -28,70 +27,79 @@ class SerialportSession extends Session {
         this.tool = null;
     }
 
+    /**
+     * The SerialPort implementation used by this session. Unit tests
+     * inject a fake through SerialportSession.serialPortOverride so the
+     * JSON-RPC protocol layer can be verified without real hardware.
+     * @return {Function} - a SerialPort compatible class.
+     */
+    getSerialPortClass () {
+        return SerialportSession.serialPortOverride || SerialPort;
+    }
+
     async didReceiveCall (method, params, completion) {
-        switch (method) {
-        case 'discover':
-            this.discover(params);
-            completion(null, null);
-            break;
-        case 'connect':
-            await this.connect(params);
-            completion(null, null);
-            break;
-        case 'disconnect':
-            await this.disconnect();
-            completion(null, null);
-            break;
-        case 'updateBaudrate':
-            completion(await this.updateBaudrate(params), null);
-            break;
-        case 'write':
-            completion(await this.write(params), null);
-            break;
-        case 'hardReset':
-            completion(await this.hardReset(), null);
-            break;
-        case 'read':
-            await this.read(params);
-            completion(null, null);
-            break;
-        case 'upload':
-            completion(await this.upload(params), null);
-            break;
-        case 'uploadFirmware':
-            completion(await this.uploadFirmware(params), null);
-            break;
-        case 'abortUpload':
-            completion(await this.abortUpload(), null);
-            break;
-        case 'listBoardFiles':
-            completion(await this.listBoardFiles(params), null);
-            break;
-        case 'readBoardFile':
-            completion(await this.readBoardFile(params), null);
-            break;
-        case 'removeBoardFile':
-            completion(await this.removeBoardFile(params), null);
-            break;
-        case 'writeBoardFile':
-            completion(await this.writeBoardFile(params), null);
-            break;
-        case 'getServices':
-            completion((this.services || []).map(service => service.uuid), null);
-            break;
-        case 'pingMe':
-            completion('willPing', null);
-            this.sendRemoteRequest('ping', null, result => {
-                console.log(`Got result from ping: ${result}`);
-            });
-            break;
-        default:
-            throw new Error(`Method not found`);
+        // The base session only catches synchronous throws; an exception
+        // escaping this async handler would crash the whole link process
+        // as an unhandled rejection and the client would wait forever for
+        // a response, so report errors via the JSON-RPC response instead.
+        try {
+            switch (method) {
+            case 'discover':
+                this.discover(params);
+                completion(null, null);
+                break;
+            case 'connect':
+                await this.connect(params);
+                completion(null, null);
+                break;
+            case 'disconnect':
+                await this.disconnect();
+                completion(null, null);
+                break;
+            case 'updateBaudrate':
+                completion(await this.updateBaudrate(params), null);
+                break;
+            case 'write':
+                completion(await this.write(params), null);
+                break;
+            case 'hardReset':
+                completion(await this.hardReset(), null);
+                break;
+            case 'read':
+                await this.read(params);
+                completion(null, null);
+                break;
+            case 'upload':
+                completion(await this.upload(params), null);
+                break;
+            case 'uploadFirmware':
+                completion(await this.uploadFirmware(params), null);
+                break;
+            case 'abortUpload':
+                completion(await this.abortUpload(), null);
+                break;
+            case 'listBoardFiles':
+                completion(await this.listBoardFiles(params), null);
+                break;
+            case 'readBoardFile':
+                completion(await this.readBoardFile(params), null);
+                break;
+            case 'removeBoardFile':
+                completion(await this.removeBoardFile(params), null);
+                break;
+            case 'writeBoardFile':
+                completion(await this.writeBoardFile(params), null);
+                break;
+            default:
+                throw new Error(`Method not found`);
+            }
+        } catch (err) {
+            completion(null, {message: `${(err && err.message) || err}`});
         }
     }
 
     discover (params) {
-        if (this.services) {
+        if (this.peripheral && this.peripheral.isOpen === true) {
             throw new Error('cannot discover when connected');
         }
         const {filters} = params;
@@ -99,10 +107,10 @@ class SerialportSession extends Session {
             throw new Error('discovery request must include filters');
         }
         this.reportedPeripherals = {};
-        SerialPort.list().then(peripheral => {
-            this.onAdvertisementReceived(peripheral, filters);
-        });
-        
+        this.getSerialPortClass().list()
+            .then(peripheral => {
+                this.onAdvertisementReceived(peripheral, filters);
+            });
     }
 
     onAdvertisementReceived (peripheral, filters) {
@@ -146,7 +154,8 @@ class SerialportSession extends Session {
                 clearInterval(this.peripheralsScanorTimer);
                 this.peripheralsScanorTimer = null;
             }
-            const port = new SerialPort({
+            const SerialPortClass = this.getSerialPortClass();
+            const port = new SerialPortClass({
                 path: peripheral.path,
                 baudRate: peripheralConfig.config.baudRate,
                 dataBits: peripheralConfig.config.dataBits,
@@ -258,18 +267,31 @@ class SerialportSession extends Session {
     write (params) {
         return new Promise((resolve, reject) => {
             const {message, encoding} = params;
-            const buffer = new Buffer.from(message, encoding);
+            const buffer = Buffer.from(message, encoding);
 
+            if (this.isInDisconnect || !this.peripheral || this.peripheral.isOpen !== true) {
+                // A write racing a teardown or an upload window (the port
+                // is temporarily closed while a flash tool owns it) is
+                // dropped on purpose; report 0 bytes written instead of an
+                // error, which the client would treat as a lost connection.
+                return resolve(0);
+            }
             try {
-                if (!this.isInDisconnect) {
-                    this.peripheral.write(buffer, 'binary', err => {
-                        if (err) {
-                            return reject(new Error(`Error while attempting to write: ${err.message}`));
-                        }
-                    });
-                    this.peripheral.drain(() => resolve(buffer.length));
-                }
-                return resolve();
+                this.peripheral.write(buffer, 'binary', err => {
+                    if (err) {
+                        return reject(new Error(`Error while attempting to write: ${err.message}`));
+                    }
+                });
+                // Respond only after the bytes left the OS buffer and report
+                // the true byte count. The old code resolved immediately with
+                // no value, which made the later drain resolve a no-op (the
+                // client saw null before the data was actually flushed).
+                this.peripheral.drain(err => {
+                    if (err) {
+                        return reject(new Error(`Error while attempting to write: ${err.message}`));
+                    }
+                    return resolve(buffer.length);
+                });
             } catch (err) {
                 return reject(err);
             }
@@ -345,7 +367,7 @@ class SerialportSession extends Session {
 
     async upload (params) {
         const {message, config, encoding} = params;
-        const code = new Buffer.from(message, encoding).toString();
+        const code = Buffer.from(message, encoding).toString();
 
         const {baudRate} = this.peripheralParams.peripheralConfig.config;
 
@@ -543,7 +565,6 @@ class SerialportSession extends Session {
         super.dispose();
         this.peripheral = null;
         this.peripheralParams = null;
-        this.services = null;
         this.reportedPeripherals = {};
         if (this.connectStateDetectorTimer) {
             clearInterval(this.connectStateDetectorTimer);
@@ -556,5 +577,12 @@ class SerialportSession extends Session {
         }
     }
 }
+
+/**
+ * Test hook: unit tests inject a fake SerialPort implementation so the
+ * JSON-RPC protocol layer can be verified on machines without hardware.
+ * @type {?Function}
+ */
+SerialportSession.serialPortOverride = null;
 
 module.exports = SerialportSession;
