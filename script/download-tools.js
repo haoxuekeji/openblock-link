@@ -1,4 +1,5 @@
 const axios = require('axios');
+const {spawn} = require('child_process');
 const os = require('os');
 const fs = require('fs');
 const ProgressBar = require('progress');
@@ -158,6 +159,44 @@ const downloadAndVerifyFile = async (fileUrl, filePath, expectedChecksum) => new
 });
 
 
+// The upstream toolchain venv ships esptool/obmpy but omits the micro:bit
+// helpers that src/upload/microbit.js spawns (`python -m uflash|microfs`).
+// Install them into the extracted venv; uflash bundles the MicroPython
+// firmware hex so flashing keeps working offline afterwards.
+const MICROBIT_PY_MODULES = ['uflash==2.0.0', 'microfs==1.4.5'];
+
+const ensureMicrobitModules = () => new Promise(resolve => {
+    const pythonDir = path.join(extractPath, 'Python');
+    let pyPath;
+    if (systemPlatform === 'darwin') {
+        pyPath = path.join(pythonDir, 'python3');
+    } else if (systemPlatform === 'linux') {
+        pyPath = path.join(pythonDir, 'bin/python3');
+    } else {
+        pyPath = path.join(pythonDir, 'python');
+    }
+
+    console.log(`Installing micro:bit python modules: ${MICROBIT_PY_MODULES.join(', ')}...`);
+    const pip = spawn(
+        pyPath,
+        ['-m', 'pip', 'install', '--no-warn-script-location', ...MICROBIT_PY_MODULES],
+        {stdio: 'inherit'}
+    );
+    pip.on('error', err => {
+        console.error('Failed to run pip for micro:bit modules:', err.message);
+        resolve(false);
+    });
+    pip.on('exit', code => {
+        if (code === 0) {
+            console.log('micro:bit python modules installed');
+            resolve(true);
+        } else {
+            console.error(`pip exited with code ${code} while installing micro:bit modules`);
+            resolve(false);
+        }
+    });
+});
+
 // Download files
 const downloadReleaseAssets = async () => {
     try {
@@ -219,6 +258,11 @@ const downloadReleaseAssets = async () => {
         const patched = fixPythonTools(path.join(extractPath, 'Python'));
         if (patched.length > 0) {
             console.log(`Patched portable Python tools: ${patched.join(', ')}`);
+        }
+
+        const microbitReady = await ensureMicrobitModules();
+        if (!microbitReady) {
+            return false;
         }
 
         return true;
