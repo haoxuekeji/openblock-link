@@ -165,37 +165,55 @@ const downloadAndVerifyFile = async (fileUrl, filePath, expectedChecksum) => new
 // firmware hex so flashing keeps working offline afterwards.
 const MICROBIT_PY_MODULES = ['uflash==2.0.0', 'microfs==1.4.5'];
 
-const ensureMicrobitModules = () => new Promise(resolve => {
+const runPython = (pyPath, args) => new Promise(resolve => {
+    const child = spawn(pyPath, args, {stdio: 'inherit'});
+    child.on('error', err => {
+        console.error(`Failed to run ${pyPath}:`, err.message);
+        resolve(1);
+    });
+    child.on('exit', code => resolve(code === null ? 1 : code));
+});
+
+const ensureMicrobitModules = async () => {
     const pythonDir = path.join(extractPath, 'Python');
-    let pyPath;
+    // First entry matches what src/upload/microbit.js spawns on each
+    // platform; the rest cover layout differences between packaged builds.
+    let candidates;
     if (systemPlatform === 'darwin') {
-        pyPath = path.join(pythonDir, 'python3');
+        candidates = ['python3', 'venv/bin/python3', 'bin/python3'];
     } else if (systemPlatform === 'linux') {
-        pyPath = path.join(pythonDir, 'bin/python3');
+        candidates = ['bin/python3', 'venv/bin/python3'];
     } else {
-        pyPath = path.join(pythonDir, 'python');
+        candidates = ['python.exe', 'python'];
+    }
+    const pyPath = candidates.map(rel => path.join(pythonDir, rel))
+        .find(p => fs.existsSync(p));
+    if (!pyPath) {
+        console.error(`WARNING: no python interpreter found under ${pythonDir}, ` +
+            'micro:bit modules NOT installed - micro:bit upload will not work');
+        return;
     }
 
     console.log(`Installing micro:bit python modules: ${MICROBIT_PY_MODULES.join(', ')}...`);
-    const pip = spawn(
-        pyPath,
-        ['-m', 'pip', 'install', '--no-warn-script-location', ...MICROBIT_PY_MODULES],
-        {stdio: 'inherit'}
-    );
-    pip.on('error', err => {
-        console.error('Failed to run pip for micro:bit modules:', err.message);
-        resolve(false);
-    });
-    pip.on('exit', code => {
-        if (code === 0) {
-            console.log('micro:bit python modules installed');
-            resolve(true);
-        } else {
-            console.error(`pip exited with code ${code} while installing micro:bit modules`);
-            resolve(false);
+    const pipArgs = ['-m', 'pip', 'install', '--no-warn-script-location', ...MICROBIT_PY_MODULES];
+    let exitCode = await runPython(pyPath, pipArgs);
+    if (exitCode !== 0) {
+        // Portable interpreters may ship without pip; bootstrap it once.
+        console.log('pip failed or missing, trying ensurepip bootstrap...');
+        const bootstrapped = await runPython(pyPath, ['-m', 'ensurepip', '--default-pip']);
+        if (bootstrapped === 0) {
+            exitCode = await runPython(pyPath, pipArgs);
         }
-    });
-});
+    }
+    if (exitCode === 0) {
+        console.log('micro:bit python modules installed');
+    } else {
+        // Deliberately non-fatal: only the micro:bit upload path degrades,
+        // the rest of the toolchain stays usable.
+        console.error('WARNING: could not install micro:bit modules ' +
+            `(${MICROBIT_PY_MODULES.join(', ')}) - micro:bit upload will not work`);
+    }
+};
 
 // Download files
 const downloadReleaseAssets = async () => {
@@ -260,10 +278,7 @@ const downloadReleaseAssets = async () => {
             console.log(`Patched portable Python tools: ${patched.join(', ')}`);
         }
 
-        const microbitReady = await ensureMicrobitModules();
-        if (!microbitReady) {
-            return false;
-        }
+        await ensureMicrobitModules();
 
         return true;
     } catch (error) {
