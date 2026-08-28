@@ -165,7 +165,9 @@ class OpenBlockLink extends Emitter{
             });
         });
 
-        this._httpServer.listen(this._port, '0.0.0.0', () => {
+        // Bind the configured host (was hardcoded to 0.0.0.0, silently
+        // ignoring the host argument, e.g. a 127.0.0.1-only deployment).
+        this._httpServer.listen(this._port, this._host, () => {
             this.emit('ready');
             console.info(clc.green(`Openblock link server start successfully, socket listen on: http://${this._host}:${this._port}`));
         });
