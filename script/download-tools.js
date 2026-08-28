@@ -161,7 +161,12 @@ const downloadAndVerifyFile = async (fileUrl, filePath, expectedChecksum) => new
 // Download files
 const downloadReleaseAssets = async () => {
     try {
-        const {data} = await axios.get(releaseApiUrl);
+        // Anonymous GitHub API calls share a 60 req/h per-IP quota, which CI
+        // runners exhaust quickly (403). Use a token when one is provided.
+        const apiOptions = process.env.GITHUB_TOKEN ?
+            {headers: {Authorization: `Bearer ${process.env.GITHUB_TOKEN}`}} :
+            {};
+        const {data} = await axios.get(releaseApiUrl, apiOptions);
         const assets = data.assets.filter(asset => asset.name.endsWith('.7z') && asset.name.includes(systemPlatform));
 
         if (assets.length === 0) {
