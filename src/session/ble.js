@@ -342,14 +342,28 @@ class BLESession extends Session {
         // whatever else the board exposes. The device counts are small on
         // the supported peripherals and this keeps read/write lookups
         // trivial and complete.
-        const services = await new Promise((resolve, reject) => {
-            peripheral.discoverAllServicesAndCharacteristics((err, discovered) => {
-                if (err) {
-                    return reject(err);
-                }
-                return resolve(discovered || []);
+        let services;
+        try {
+            services = await new Promise((resolve, reject) => {
+                peripheral.discoverAllServicesAndCharacteristics((err, discovered) => {
+                    if (err) {
+                        return reject(err);
+                    }
+                    return resolve(discovered || []);
+                });
             });
-        });
+        } catch (err) {
+            // The BLE link is already up at this point; leaving it half
+            // open would block later reconnects (these boards accept a
+            // single central), so tear it down before reporting failure.
+            peripheral.removeListener('disconnect', this._onPeripheralDisconnect);
+            try {
+                peripheral.disconnect();
+            } catch (e) {
+                // already gone
+            }
+            throw err;
+        }
 
         this.characteristics = {};
         services.forEach(service => {
@@ -552,18 +566,22 @@ class BLESession extends Session {
     }
 
     /**
-     * Stop scanning and detach the discover listener.
+     * Stop scanning and detach the discover listener. The listener is
+     * removed even when no scan is running: discover() attaches it before
+     * startScanning, so a failed scan start would otherwise leak the
+     * listener on the process wide noble singleton (and keep pushing
+     * discoveries into a disposed session).
      * @private
      */
     _stopScanning () {
-        if (!this.scanning) {
-            return;
-        }
+        const wasScanning = this.scanning;
         this.scanning = false;
         try {
             const noble = this.getNoble();
             noble.removeListener('discover', this._onDiscover);
-            noble.stopScanning();
+            if (wasScanning) {
+                noble.stopScanning();
+            }
         } catch (e) {
             // noble unavailable: nothing was scanning.
         }

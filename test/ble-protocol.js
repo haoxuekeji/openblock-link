@@ -88,16 +88,23 @@ class FakePeripheral extends EventEmitter {
         };
         this._services = services;
         this.connected = false;
+        this.failDiscovery = false;
+        this.disconnectCalls = 0;
     }
     connect (cb) {
         this.connected = true;
         process.nextTick(() => cb(null));
     }
     disconnect () {
+        this.disconnectCalls += 1;
         this.connected = false;
         this.emit('disconnect');
     }
     discoverAllServicesAndCharacteristics (cb) {
+        if (this.failDiscovery) {
+            process.nextTick(() => cb(new Error('GATT discovery failed')));
+            return;
+        }
         process.nextTick(() => cb(null, this._services));
     }
 }
@@ -110,8 +117,14 @@ class FakeNoble extends EventEmitter {
         this.scanning = false;
         this.lastScanServices = null;
         this.stopped = 0;
+        this.failNextScan = false;
     }
     startScanning (serviceUuids, allowDuplicates, cb) {
+        if (this.failNextScan) {
+            this.failNextScan = false;
+            process.nextTick(() => cb(new Error('adapter busy')));
+            return;
+        }
         this.scanning = true;
         this.lastScanServices = serviceUuids;
         process.nextTick(() => cb(null));
@@ -256,6 +269,49 @@ const run = async () => {
     board.disconnect();
     await wait(10);
     check(socket.closed === true, 'unexpected peripheral disconnect closes the websocket');
+
+    // ---- BLE：startScanning 失败 → 错误响应，dispose 不泄漏 discover 监听器 ----
+    const failScanSocket = new FakeSocket();
+    const failScanSession = new BLESession(failScanSocket);
+    fakeNoble.failNextScan = true;
+    rpc(failScanSession, 8, 'discover', {filters: [{services: [NUS]}]});
+    await wait(20);
+    const failScanResponse = failScanSocket.sent.filter(frame => frame.id === 8)[0];
+    check(failScanResponse && failScanResponse.error &&
+        `${failScanResponse.error.message}`.indexOf('adapter busy') !== -1,
+    'failed startScanning reported as JSON-RPC error');
+    failScanSession.dispose();
+    check(fakeNoble.listeners('discover').length === 0,
+        `dispose after failed scan detaches the discover listener (got ${fakeNoble.listeners('discover').length})`);
+
+    // ---- BLE：connect 后服务发现失败 → 主动断开，不留半开连接，可重试 ----
+    const zombieSocket = new FakeSocket();
+    const zombieSession = new BLESession(zombieSocket);
+    const zombieBoard = new FakePeripheral('11:22:33', 'OB32-zombie',
+        ['6e400001b5a3f393e0a9e50e24dcca9e'],
+        [{uuid: '6e400001b5a3f393e0a9e50e24dcca9e', characteristics: [new FakeCharacteristic('2a19', ['read'])]}]);
+    rpc(zombieSession, 9, 'discover', {filters: [{services: [NUS]}]});
+    await wait(20);
+    fakeNoble.emit('discover', zombieBoard);
+    await wait(10);
+    zombieBoard.failDiscovery = true;
+    rpc(zombieSession, 10, 'connect', {peripheralId: '11:22:33'});
+    await wait(20);
+    const zombieResponse = zombieSocket.sent.filter(frame => frame.id === 10)[0];
+    check(zombieResponse && zombieResponse.error &&
+        `${zombieResponse.error.message}`.indexOf('GATT discovery failed') !== -1,
+    'failed service discovery reported as JSON-RPC error');
+    check(zombieBoard.connected === false && zombieBoard.disconnectCalls === 1,
+        'failed service discovery tears the BLE link down');
+    check(zombieSocket.closed === false,
+        'cleanup disconnect does not close the websocket (client may retry)');
+    zombieBoard.failDiscovery = false;
+    rpc(zombieSession, 11, 'connect', {peripheralId: '11:22:33'});
+    await wait(20);
+    const zombieRetryResponse = zombieSocket.sent.filter(frame => frame.id === 11)[0];
+    check(zombieRetryResponse && !zombieRetryResponse.error && zombieBoard.connected === true,
+        'connect retry succeeds after the cleanup');
+    zombieSession.dispose();
 
     BLESession.nobleOverride = null;
 
