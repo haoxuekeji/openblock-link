@@ -98,16 +98,19 @@ class Microbit {
         return new Promise(resolve => {
             const ufs = spawn(this._pyPath, ['-m', MICROFS_MODULE_NAME, 'ls']);
 
-            ufs.on('error', err => {
-                clearInterval(listenAbortSignal);
-                return resolve('Failed');
-            });
-
             const listenAbortSignal = setInterval(() => {
                 if (this._abort) {
                     ufs.kill();
                 }
             }, ABORT_STATE_CHECK_INTERVAL);
+
+            ufs.on('error', err => {
+                clearInterval(listenAbortSignal);
+                // Spawn failures (missing python, bad path) were silent
+                // here: the caller only saw a bare 'Failed'.
+                this._sendstd(`${ansi.red}${err.message}\n`);
+                return resolve('Failed');
+            });
 
             ufs.on('exit', outCode => {
                 clearInterval(listenAbortSignal);
@@ -127,6 +130,12 @@ class Microbit {
         return new Promise((resolve, reject) => {
             const ufs = spawn(this._pyPath, ['-m', MICROFS_MODULE_NAME, 'put', file]);
 
+            const listenAbortSignal = setInterval(() => {
+                if (this._abort) {
+                    ufs.kill();
+                }
+            }, ABORT_STATE_CHECK_INTERVAL);
+
             ufs.on('error', err => {
                 clearInterval(listenAbortSignal);
                 return reject(err);
@@ -136,12 +145,6 @@ class Microbit {
                 this._sendstd(ansi.red + buf.toString());
                 return resolve('Failed');
             });
-
-            const listenAbortSignal = setInterval(() => {
-                if (this._abort) {
-                    ufs.kill();
-                }
-            }, ABORT_STATE_CHECK_INTERVAL);
 
             ufs.on('exit', outCode => {
                 clearInterval(listenAbortSignal);
